@@ -83,11 +83,10 @@ def toeplitz_fwd_kernel_2d(
     row_start = pid_m * BLOCK_SIZE_M
     col_start = pid_n * BLOCK_SIZE_N
 
+    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
     # skip tiles strictly above the diagonal
     if pid_n > pid_m:
         return
-
-    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
     cols = col_start + tl.arange(0, BLOCK_SIZE_N)
     row_mask = rows < M
     col_mask = cols < M
@@ -110,16 +109,23 @@ def toeplitz_fwd_kernel_2d(
 
 @triton.autotune(
     configs=[
+        # Small-M focused variants
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 32,  "BLOCK_SIZE_N": 32},  num_warps=1, num_stages=2),
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_N": 32},  num_warps=2, num_stages=2),
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_N": 64},  num_warps=2, num_stages=2),
         # 2D grid over columns (no inner loop)
-        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64},  num_warps=4, num_stages=2),
         triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128}, num_warps=4, num_stages=2),
-        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=3),
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64},  num_warps=8, num_stages=3),
         triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128}, num_warps=8, num_stages=3),
         # Loop over columns within each program (helps when full row doesn't fit in SRAM)
-        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=2),
-        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=3),
+        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 32,  "BLOCK_SIZE_N": 32},  num_warps=1, num_stages=2),
+        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_N": 32},  num_warps=2, num_stages=2),
+        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_N": 64},  num_warps=2, num_stages=2),
+        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64},  num_warps=4, num_stages=2),
+        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64},  num_warps=8, num_stages=3),
     ],
-    key=["M"],
+    key=["M", "B"],
 )
 @triton.jit
 def toeplitz_fwd_kernel_auto(
@@ -150,34 +156,31 @@ def toeplitz_fwd_kernel_auto(
 
         # Iterate tiles of columns to bound register/SRAM usage per step
         for col_start in tl.static_range(0, M, BLOCK_SIZE_N):
-            # Skip tiles strictly above the diagonal band for this row block
-            if col_start > row_start + BLOCK_SIZE_M - 1:
-                continue
+            # Process only tiles not strictly above the diagonal band for this row block
+            if col_start <= row_start + BLOCK_SIZE_M - 1:
+                cols = col_start + tl.arange(0, BLOCK_SIZE_N)
+                col_mask = cols < M
 
-            cols = col_start + tl.arange(0, BLOCK_SIZE_N)
-            col_mask = cols < M
+                d = rows[:, None] - cols[None, :]
+                lower_mask = (d >= 0) & row_mask[:, None] & col_mask[None, :]
+                d_safe = tl.where(lower_mask, d, 0)
 
-            d = rows[:, None] - cols[None, :]
-            lower_mask = (d >= 0) & row_mask[:, None] & col_mask[None, :]
-            d_safe = tl.where(lower_mask, d, 0)
+                v = tl.load(vals_b_ptr + d_safe * stride_vals_m, mask=lower_mask, other=0)
 
-            v = tl.load(vals_b_ptr + d_safe * stride_vals_m, mask=lower_mask, other=0)
-
-            out_ptrs = (
-                out_ptr
-                + pid_b * stride_out_b
-                + rows[:, None] * stride_out_i
-                + cols[None, :] * stride_out_j
-            )
-            tl.store(out_ptrs, v, mask=lower_mask, eviction_policy="evict_last")
+                out_ptrs = (
+                    out_ptr
+                    + pid_b * stride_out_b
+                    + rows[:, None] * stride_out_i
+                    + cols[None, :] * stride_out_j
+                )
+                tl.store(out_ptrs, v, mask=lower_mask, eviction_policy="evict_last")
     else:
         # 2D column tiling via program_id(2)
         col_start = pid_n * BLOCK_SIZE_N
+        rows = row_start + tl.arange(0, BLOCK_SIZE_M)
         # skip tiles strictly above the diagonal
         if pid_n > pid_m:
             return
-
-        rows = row_start + tl.arange(0, BLOCK_SIZE_M)
         cols = col_start + tl.arange(0, BLOCK_SIZE_N)
         row_mask = rows < M
         col_mask = cols < M
@@ -370,16 +373,20 @@ def toeplitz_bwd_kernel_diag(
 
 @triton.autotune(
     configs=[
-        # k-stripe variants
-        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2),
+        # Small-M focused k-stripe variants
+        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_K": 32},  num_warps=2, num_stages=2),
+        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 32},  num_warps=4, num_stages=2),
+        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64},  num_warps=4, num_stages=2),
         triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
-        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3),
+        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 64},  num_warps=8, num_stages=3),
         triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3),
-        # diagonal variants (BLOCK_SIZE_K is dummy)
+        # Small-M focused diagonal variants (BLOCK_SIZE_K is dummy)
+        triton.Config({"USE_DIAG": 1, "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_K": 1}, num_warps=2, num_stages=2),
+        triton.Config({"USE_DIAG": 1, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 1}, num_warps=4, num_stages=2),
         triton.Config({"USE_DIAG": 1, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 1}, num_warps=4, num_stages=2),
         triton.Config({"USE_DIAG": 1, "BLOCK_SIZE_M": 512, "BLOCK_SIZE_K": 1}, num_warps=8, num_stages=3),
     ],
-    key=["M"],
+    key=["M", "B"],
     reset_to_zero=["grad_vals_ptr"],
 )
 @triton.jit
@@ -458,6 +465,7 @@ def toeplitz_bwd_kernel_auto(
         gvals_ptrs = gvals_base + ks * stride_gvals_m
         tl.atomic_add(gvals_ptrs, partial, mask=k_mask)
 
+
 class Toeplitz(torch.autograd.Function):
     @staticmethod
     def forward(ctx, vals: torch.Tensor):
@@ -471,12 +479,13 @@ class Toeplitz(torch.autograd.Function):
         stride_vals_b, stride_vals_m = vals_2d.stride()
         stride_out_b, stride_out_i, stride_out_j = out.stride()
 
-        grid_2d = lambda META: (
+        grid_auto = lambda META: (
             b,
             triton.cdiv(m, META["BLOCK_SIZE_M"]),
-            triton.cdiv(m, META["BLOCK_SIZE_N"]),
+            # If we loop over N inside the kernel, we only need one pid along N
+            (1 if META.get("USE_LOOP_N", 0) else triton.cdiv(m, META["BLOCK_SIZE_N"]))
         )
-        toeplitz_fwd_kernel_2d[grid_2d](
+        toeplitz_fwd_kernel_auto[grid_auto](
             vals_2d,
             out,
             stride_vals_b,
@@ -584,21 +593,24 @@ def bench(m: int, provider: str, dtype: torch.dtype, batch: int):
         ms = triton.testing.do_bench(lambda: toeplitz_triton(vals))
     return ms
 
-
+bsz_list = [1, 4, 16, 64]
+m_list = [64, 128, 256, 512, 1024, 2048]
+from itertools import product
+combinations_list = list(product(bsz_list, m_list))
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["m"],
-        x_vals=[64, 128, 256, 512, 1024, 2048],
+        x_names=["batch", "m"],
+        x_vals=combinations_list,
         line_arg="provider",
         line_vals=["pytorch", "triton"],
         line_names=["PyTorch Backward", "Triton Backward"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="ms",
         plot_name="Lower-tri Toeplitz Backward: Triton vs PyTorch",
-        args={"dtype": torch.float32, "batch": 16},
+        args={"dtype": torch.float32},
     )
 )
-def bench_backward(m: int, provider: str, dtype: torch.dtype, batch: int):
+def bench_backward(batch: int, m: int, provider: str, dtype: torch.dtype):
     device = "cuda"
     vals = torch.randn(batch, m, device=device, dtype=dtype, requires_grad=True)
     if provider == "pytorch":
@@ -659,7 +671,11 @@ def validate_toeplitz_correctness(m: int = 128,
 if __name__ == "__main__":
 
     validate_toeplitz_correctness(m=16)
-    bench.run(print_data=True)
-    bench_backward.run(print_data=True)
+    results_fwd = bench.run(print_data=True, return_df=True)
+    results_bwd = bench_backward.run(print_data=True, return_df=True)
+
+    output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+    results_fwd.to_csv(os.path.join(output_dir, "results_fwd.csv"))
+    results_bwd.to_csv(os.path.join(output_dir, "results_bwd.csv"))
 
 

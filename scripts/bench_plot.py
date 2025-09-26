@@ -1,5 +1,6 @@
 import os
 import sys
+import triton
 
 # Allow running this script from the repository's scripts/ directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -34,32 +35,33 @@ def main():
     device = "cuda"
     dtype = torch.float32
     batch = 16
-    sizes = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    sizes = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
     results = {"eager": [], "compiled": [], "triton": []}
 
     for m in sizes:
         vals = torch.randn(batch, m, device=device, dtype=dtype)
 
-        ms_eager = time_ms(reference_toeplitz, vals)
-        ms_comp = time_ms(reference_toeplitz_compiled, vals)
-        # Backward selection benchmark via env override
-        os.environ["EFK_BWD_IMPL"] = "kstripe"
-        ms_triton = time_ms(toeplitz_triton, vals)
+        ms_eager = triton.testing.do_bench(lambda : reference_toeplitz(vals))
+        ms_comp = triton.testing.do_bench(lambda : reference_toeplitz_compiled(vals))
+        ms_triton = triton.testing.do_bench(lambda : toeplitz_triton(vals))
 
         results["eager"].append(ms_eager)
         results["compiled"].append(ms_comp)
         results["triton"].append(ms_triton)
         print(f"m={m:4d}  eager={ms_eager:7.3f}  compiled={ms_comp:7.3f}  triton={ms_triton:7.3f}")
 
-    os.makedirs("assets", exist_ok=True)
+    os.makedirs("../assets", exist_ok=True)
     plt.figure(figsize=(7, 4))
     plt.plot(sizes, results["eager"], label="PyTorch", color="blue")
+    plt.scatter(sizes, results["eager"], color="blue", s=24, zorder=3)
     plt.plot(sizes, results["compiled"], label="Torch Compile", color="orange")
+    plt.scatter(sizes, results["compiled"], color="orange", s=24, zorder=3)
     plt.plot(sizes, results["triton"], label="Triton", color="green")
-    plt.xlabel("m")
-    plt.ylabel("ms")
-    plt.title("Lower-tri Toeplitz: Triton vs PyTorch")
+    plt.scatter(sizes, results["triton"], color="green", s=24, zorder=3)
+    plt.xlabel("Size")
+    plt.ylabel("Time [ms]")
+    plt.title("Lower triangular Toeplitz: Pytorch vs Triton")
     plt.legend()
     out_path = os.path.join("assets", "bench_forward.png")
     plt.tight_layout()
