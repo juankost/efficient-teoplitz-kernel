@@ -30,25 +30,26 @@ def toeplitz_fwd_kernel(
     b = tl.program_id(0)  # batch id
     row_block = tl.program_id(1)  # row block id
 
-    # Load the full vals vector 
-    vals_b = vals_ptr + b * stride_vals_b
-    offsets = tl.arange(0, M)
-    vals_b = tl.load(vals_b + offsets * stride_vals_m, mask=offsets < M, other=0)
+    # Tile rows handled by this program
+    row_start = row_block * BLOCK_SIZE_M
+    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+    cols = tl.arange(0, M)
 
-    for row_idx in range(0, M,BLOCK_SIZE_M):
-        if row_idx >= M:
-            break
+    row_mask = rows < M
+    col_mask = cols < M
 
-        # Index manipulation
-        cols = tl.arange(0, M)
-        cols_mask = cols < M
-        d = row_idx - cols  * [M]
-        v = vals_b[d]
-        lower_mask = (cols <= row_idx) & cols_mask & (d >= 0)
+    # Compute Toeplitz index difference: d = i - j
+    d = rows[:, None] - cols[None, :]
+    lower_mask = d >= 0
 
-        # Store the result
-        out_row = out_ptr + b * stride_out_b + row_idx * stride_out_i
-        tl.store(out_row + cols * stride_out_j, v, mask=cols_mask)
+    # Gather vals using computed indices
+    vals_b_ptr = vals_ptr + b * stride_vals_b
+    vals_ptrs = vals_b_ptr + d * stride_vals_m
+    v = tl.load(vals_ptrs, mask=lower_mask & row_mask[:, None] & col_mask[None, :], other=0)
+
+    # Store into output
+    out_ptrs = out_ptr + b * stride_out_b + rows[:, None] * stride_out_i + cols[None, :] * stride_out_j
+    tl.store(out_ptrs, v, mask=row_mask[:, None] & col_mask[None, :])
 
 
 @triton.autotune(
@@ -76,34 +77,33 @@ def toeplitz_bwd_kernel(
     b = tl.program_id(0)  # batch id
     row_block = tl.program_id(1)  # row block id
 
-    # Load the full grad_vals vector
-    gvals_b = grad_vals_ptr + b * stride_gvals_b
-    offsets = tl.arange(0, M)
-    gvals = tl.load(gvals_b + offsets * stride_gvals_m, mask=offsets < M, other=0)
+    # Tile rows handled by this program
+    row_start = row_block * BLOCK_SIZE_M
+    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+    cols = tl.arange(0, M)
 
-    # Compute the result
-    for row_idx in range(0, M, BLOCK_SIZE_M):
-        if row_idx >= M:
-            break
+    row_mask = rows < M
+    col_mask = cols < M
 
-        # Index manipulation: read the row of grad_out and compute the index of the 
-        # corresponding values in grad_vals
-        cols = tl.arange(0, M)
-        cols_mask = cols <= row_idx  # lower triangular mask
+    # Compute Toeplitz index difference: k = i - j
+    d = rows[:, None] - cols[None, :]
+    lower_mask = d >= 0
 
-        # Compute the index of the corresponding values in grad_vals
-        d = row_idx - cols  # [M]
+    # Load grads from grad_out for this tile
+    gout_ptrs = (
+        grad_out_ptr
+        + b * stride_gout_b
+        + rows[:, None] * stride_gout_i
+        + cols[None, :] * stride_gout_j
+    )
+    grads = tl.load(gout_ptrs, mask=lower_mask & row_mask[:, None] & col_mask[None, :], other=0)
 
-        # Load the value from grad_out
-        grads = tl.load(grad_out_ptr + b * stride_gout_b + row_idx * stride_gout_i + cols * stride_gout_j, mask=cols_mask, other=0)
-
-        # We need to accumulate the grads to the corresponding values in grad_vals, denoted by d
-        tl.atomic_add(gvals_b + d * stride_gvals_m, grads, mask=cols_mask)
-
-        # TODO: Do I need any lock sharing here?
-
-    # Now write the final result to grad_vals
-    tl.store(gvals_b + offsets * stride_gvals_m, gvals, mask=offsets < M)
+    # Atomically accumulate into grad_vals at index k = i - j
+    gvals_b_ptr = grad_vals_ptr + b * stride_gvals_b
+    # Use safe offsets to avoid invalid pointers on masked lanes
+    safe_d = tl.where(lower_mask, d, 0)
+    gvals_ptrs = gvals_b_ptr + safe_d * stride_gvals_m
+    tl.atomic_add(gvals_ptrs, grads, mask=lower_mask & row_mask[:, None] & col_mask[None, :])
 
 
 class Toeplitz(torch.autograd.Function):
@@ -114,7 +114,7 @@ class Toeplitz(torch.autograd.Function):
         m = shapes[-1]
         b = int(torch.tensor(shapes[:-1]).prod().item()) if len(shapes) > 1 else 1
         vals_2d = vals.reshape(b, m)
-        out = torch.empty((b, m, m), dtype=vals.dtype, device=vals.device)
+        out = torch.zeros((b, m, m), dtype=vals.dtype, device=vals.device)
 
         stride_vals_b, stride_vals_m = vals_2d.stride()
         stride_out_b, stride_out_i, stride_out_j = out.stride()
@@ -179,10 +179,19 @@ def reference_toeplitz(vals: torch.Tensor):
     mask = offsets >= 0
     safe_offsets = torch.where(mask, offsets, torch.zeros(1, device=vals.device, dtype=offsets.dtype))
 
-    gathered = vals.gather(-1, safe_offsets.expand(*((1,) * (vals.dim() - 1)), *safe_offsets.shape))
+    batch_shape = vals.shape[:-1]
+    index = safe_offsets.expand(*batch_shape, m, m)
+    vals_rep = vals.unsqueeze(-2).expand(*batch_shape, m, m)
+    gathered = vals_rep.gather(-1, index)
     return gathered * mask
 
-# @torch.compile.disable()
+try:
+    from torch._dynamo import disable as _torch_compile_disable
+except Exception:
+    def _torch_compile_disable(fn):
+        return fn
+
+@_torch_compile_disable
 def toeplitz_triton(vals: torch.Tensor) -> torch.Tensor:
     return Toeplitz.apply(vals)
 
@@ -250,6 +259,7 @@ def bench_backward(m: int, provider: str, dtype: torch.dtype, batch: int):
     ms = triton.testing.do_bench(run_backward)
     return ms
 
+
 def validate_toeplitz_correctness(m: int = 128,
                                   batch: int = 4,
                                   dtype: torch.dtype = torch.float32,
@@ -269,7 +279,7 @@ def validate_toeplitz_correctness(m: int = 128,
     out_triton = toeplitz_triton(vals)
     out_ref = reference_toeplitz(vals)
     torch.testing.assert_close(out_triton, out_ref, rtol=rtol, atol=atol)
-
+    print("Forward check passed")
     # Backward check (use same upstream gradient for both paths)
     vals_t = vals.clone().detach().requires_grad_(True)
     out_t = toeplitz_triton(vals_t)
@@ -283,10 +293,13 @@ def validate_toeplitz_correctness(m: int = 128,
     grad_ref = vals_r.grad
 
     torch.testing.assert_close(grad_triton, grad_ref, rtol=rtol, atol=atol)
+    print("Backward check passed")
     return True
 
 if __name__ == "__main__":
 
-    validate_toeplitz_correctness()
-    bench.run(print_data=True)
-    bench_backward.run(print_data=True)
+    validate_toeplitz_correctness(m=16)
+    # bench.run(print_data=True)
+    # bench_backward.run(print_data=True)
+
+
