@@ -63,7 +63,9 @@ def main():
     plt.ylabel("Time [ms]")
     plt.title("Lower triangular Toeplitz: Pytorch vs Triton")
     plt.legend()
-    out_path = os.path.join("assets", "bench_forward.png")
+
+    
+    out_path = os.path.join(os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets"), "bench_forward.png")
     plt.tight_layout()
     plt.savefig(out_path, dpi=160)
     print(f"Saved plot to {out_path}")
