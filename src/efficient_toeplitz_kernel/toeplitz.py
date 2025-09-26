@@ -110,6 +110,95 @@ def toeplitz_fwd_kernel_2d(
 
 @triton.autotune(
     configs=[
+        # 2D grid over columns (no inner loop)
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=3),
+        triton.Config({"USE_LOOP_N": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128}, num_warps=8, num_stages=3),
+        # Loop over columns within each program (helps when full row doesn't fit in SRAM)
+        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"USE_LOOP_N": 1, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=3),
+    ],
+    key=["M"],
+)
+@triton.jit
+def toeplitz_fwd_kernel_auto(
+    vals_ptr,    # [B, M]
+    out_ptr,     # [B, M, M]
+    stride_vals_b,
+    stride_vals_m,
+    stride_out_b,
+    stride_out_i,
+    stride_out_j,
+    B: tl.constexpr,
+    M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    USE_LOOP_N: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    row_start = pid_m * BLOCK_SIZE_M
+
+    vals_b_ptr = vals_ptr + pid_b * stride_vals_b
+
+    if USE_LOOP_N:
+        rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = rows < M
+
+        # Iterate tiles of columns to bound register/SRAM usage per step
+        for col_start in tl.static_range(0, M, BLOCK_SIZE_N):
+            # Skip tiles strictly above the diagonal band for this row block
+            if col_start > row_start + BLOCK_SIZE_M - 1:
+                continue
+
+            cols = col_start + tl.arange(0, BLOCK_SIZE_N)
+            col_mask = cols < M
+
+            d = rows[:, None] - cols[None, :]
+            lower_mask = (d >= 0) & row_mask[:, None] & col_mask[None, :]
+            d_safe = tl.where(lower_mask, d, 0)
+
+            v = tl.load(vals_b_ptr + d_safe * stride_vals_m, mask=lower_mask, other=0)
+
+            out_ptrs = (
+                out_ptr
+                + pid_b * stride_out_b
+                + rows[:, None] * stride_out_i
+                + cols[None, :] * stride_out_j
+            )
+            tl.store(out_ptrs, v, mask=lower_mask, eviction_policy="evict_last")
+    else:
+        # 2D column tiling via program_id(2)
+        col_start = pid_n * BLOCK_SIZE_N
+        # skip tiles strictly above the diagonal
+        if pid_n > pid_m:
+            return
+
+        rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+        cols = col_start + tl.arange(0, BLOCK_SIZE_N)
+        row_mask = rows < M
+        col_mask = cols < M
+
+        d = rows[:, None] - cols[None, :]
+        lower_mask = (d >= 0) & row_mask[:, None] & col_mask[None, :]
+        d_safe = tl.where(lower_mask, d, 0)
+
+        v = tl.load(vals_b_ptr + d_safe * stride_vals_m, mask=lower_mask, other=0)
+
+        out_ptrs = (
+            out_ptr
+            + pid_b * stride_out_b
+            + rows[:, None] * stride_out_i
+            + cols[None, :] * stride_out_j
+        )
+        tl.store(out_ptrs, v, mask=lower_mask, eviction_policy="evict_last")
+
+
+@triton.autotune(
+    configs=[
         triton.Config({"BLOCK_SIZE_M": 64}, num_warps=2),
         triton.Config({"BLOCK_SIZE_M": 128}, num_warps=4),
         triton.Config({"BLOCK_SIZE_M": 256}, num_warps=4),
