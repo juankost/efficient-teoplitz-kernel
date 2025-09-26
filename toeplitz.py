@@ -1,0 +1,292 @@
+import torch
+import triton
+import triton.language as tl
+import math
+
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_M": 64}, num_warps=2),
+        triton.Config({"BLOCK_SIZE_M": 128}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 256}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 512}, num_warps=8),
+    ],
+    key=["M"],
+)
+@triton.jit
+def toeplitz_fwd_kernel(
+    vals_ptr,    # [B, M]
+    out_ptr,     # [B, M, M]
+    stride_vals_b,
+    stride_vals_m,
+    stride_out_b,
+    stride_out_i,
+    stride_out_j,
+    B: tl.constexpr,
+    M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    b = tl.program_id(0)  # batch id
+    row_block = tl.program_id(1)  # row block id
+
+    # Load the full vals vector 
+    vals_b = vals_ptr + b * stride_vals_b
+    offsets = tl.arange(0, M)
+    vals_b = tl.load(vals_b + offsets * stride_vals_m, mask=offsets < M, other=0)
+
+    for row_idx in range(0, M,BLOCK_SIZE_M):
+        if row_idx >= M:
+            break
+
+        # Index manipulation
+        cols = tl.arange(0, M)
+        cols_mask = cols < M
+        d = row_idx - cols  * [M]
+        v = vals_b[d]
+        lower_mask = (cols <= row_idx) & cols_mask & (d >= 0)
+
+        # Store the result
+        out_row = out_ptr + b * stride_out_b + row_idx * stride_out_i
+        tl.store(out_row + cols * stride_out_j, v, mask=cols_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_M": 64}, num_warps=2),
+        triton.Config({"BLOCK_SIZE_M": 128}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 256}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 512}, num_warps=8),
+    ],
+    key=["M"],
+)
+@triton.jit
+def toeplitz_bwd_kernel(
+    grad_vals_ptr,  # [B, M]
+    grad_out_ptr,   # [B, M, M]
+    stride_gvals_b,
+    stride_gvals_m,
+    stride_gout_b,
+    stride_gout_i,
+    stride_gout_j,
+    B: tl.constexpr,
+    M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    b = tl.program_id(0)  # batch id
+    row_block = tl.program_id(1)  # row block id
+
+    # Load the full grad_vals vector
+    gvals_b = grad_vals_ptr + b * stride_gvals_b
+    offsets = tl.arange(0, M)
+    gvals = tl.load(gvals_b + offsets * stride_gvals_m, mask=offsets < M, other=0)
+
+    # Compute the result
+    for row_idx in range(0, M, BLOCK_SIZE_M):
+        if row_idx >= M:
+            break
+
+        # Index manipulation: read the row of grad_out and compute the index of the 
+        # corresponding values in grad_vals
+        cols = tl.arange(0, M)
+        cols_mask = cols <= row_idx  # lower triangular mask
+
+        # Compute the index of the corresponding values in grad_vals
+        d = row_idx - cols  # [M]
+
+        # Load the value from grad_out
+        grads = tl.load(grad_out_ptr + b * stride_gout_b + row_idx * stride_gout_i + cols * stride_gout_j, mask=cols_mask, other=0)
+
+        # We need to accumulate the grads to the corresponding values in grad_vals, denoted by d
+        tl.atomic_add(gvals_b + d * stride_gvals_m, grads, mask=cols_mask)
+
+        # TODO: Do I need any lock sharing here?
+
+    # Now write the final result to grad_vals
+    tl.store(gvals_b + offsets * stride_gvals_m, gvals, mask=offsets < M)
+
+
+class Toeplitz(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, vals: torch.Tensor):
+        vals = vals.contiguous()
+        shapes = vals.shape
+        m = shapes[-1]
+        b = int(torch.tensor(shapes[:-1]).prod().item()) if len(shapes) > 1 else 1
+        vals_2d = vals.reshape(b, m)
+        out = torch.empty((b, m, m), dtype=vals.dtype, device=vals.device)
+
+        stride_vals_b, stride_vals_m = vals_2d.stride()
+        stride_out_b, stride_out_i, stride_out_j = out.stride()
+
+        grid = lambda META: (b, triton.cdiv(m, META["BLOCK_SIZE_M"]))
+        toeplitz_fwd_kernel[grid](
+            vals_2d,
+            out,
+            stride_vals_b,
+            stride_vals_m,
+            stride_out_b,
+            stride_out_i,
+            stride_out_j,
+            B=b,
+            M=m,
+
+        )
+        ctx.m = m
+        ctx.shapes = shapes
+        return out.reshape(*shapes[:-1], m, m)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        m = ctx.m
+        shapes = ctx.shapes
+        grad_output = grad_output.contiguous()
+        b = int(torch.tensor(shapes[:-1]).prod().item()) if len(shapes) > 1 else 1
+        grad_output_3d = grad_output.reshape(b, m, m)
+        grad_vals = torch.zeros((b, m), dtype=grad_output.dtype, device=grad_output.device)
+
+        stride_gvals_b, stride_gvals_m = grad_vals.stride()
+        stride_gout_b, stride_gout_i, stride_gout_j = grad_output_3d.stride()
+
+        grid = lambda META: (b, triton.cdiv(m, META["BLOCK_SIZE_M"]))
+        toeplitz_bwd_kernel[grid](
+            grad_vals,
+            grad_output_3d,
+            stride_gvals_b,
+            stride_gvals_m,
+            stride_gout_b,
+            stride_gout_i,
+            stride_gout_j,
+            B=b,
+            M=m,
+        )
+        return grad_vals.reshape(*shapes),
+
+
+def reference_toeplitz(vals: torch.Tensor):
+    """
+    Build a lower-triangular Toeplitz matrix from diagonal values.
+    Input: vals [..., m]
+    Output: toeplitz [..., m, m], toeplitz[..., i, j] = vals[..., i-j] if i>=j else 0
+    """
+    m = vals.shape[-1]
+
+    # Indices for broadcasting
+    i = torch.arange(m, device=vals.device)
+    j = torch.arange(m, device=vals.device)
+
+    offsets = i[:, None] - j[None, :]
+    mask = offsets >= 0
+    safe_offsets = torch.where(mask, offsets, torch.zeros(1, device=vals.device, dtype=offsets.dtype))
+
+    gathered = vals.gather(-1, safe_offsets.expand(*((1,) * (vals.dim() - 1)), *safe_offsets.shape))
+    return gathered * mask
+
+# @torch.compile.disable()
+def toeplitz_triton(vals: torch.Tensor) -> torch.Tensor:
+    return Toeplitz.apply(vals)
+
+
+reference_toeplitz_compiled = torch.compile(reference_toeplitz, fullgraph=False)
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["m"],
+        x_vals=[64, 128, 256, 512, 1024],
+        line_arg="provider",
+        line_vals=["eager", "compiled", "triton"],
+        line_names=["PyTorch", "Torch Compile", "Triton"],
+        styles=[("blue", "-"), ("orange", "-"), ("green", "-")],
+        ylabel="ms",
+        plot_name="Lower-tri Toeplitz: Triton vs PyTorch",
+        args={"dtype": torch.float32, "batch": 16},
+    )
+)
+def bench(m: int, provider: str, dtype: torch.dtype, batch: int):
+    device = "cuda"
+    vals = torch.randn(batch, m, device=device, dtype=dtype)
+
+    if provider == "eager":
+        ms = triton.testing.do_bench(reference_toeplitz, vals)
+    if provider == "compiled":
+        ms = triton.testing.do_bench(reference_toeplitz_compiled, vals)
+    if provider == "triton":
+        ms = triton.testing.do_bench(toeplitz_triton, vals)
+    return ms
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["m"],
+        x_vals=[64, 128, 256, 512, 1024],
+        line_arg="provider",
+        line_vals=["pytorch", "triton"],
+        line_names=["PyTorch Backward", "Triton Backward"],
+        styles=[("blue", "-"), ("green", "-")],
+        ylabel="ms",
+        plot_name="Lower-tri Toeplitz Backward: Triton vs PyTorch",
+        args={"dtype": torch.float32, "batch": 16},
+    )
+)
+def bench_backward(m: int, provider: str, dtype: torch.dtype, batch: int):
+    device = "cuda"
+    vals = torch.randn(batch, m, device=device, dtype=dtype, requires_grad=True)
+    if provider == "pytorch":
+        out = reference_toeplitz(vals)
+    elif provider == "triton":
+        out = toeplitz_triton(vals)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+    grad_out = torch.randn_like(out)
+
+    def run_backward():
+        if vals.grad is not None:
+            vals.grad = None
+        out.backward(grad_out, retain_graph=True)
+
+    # Warmup once to allow any setup/compilation
+    run_backward()
+    ms = triton.testing.do_bench(run_backward)
+    return ms
+
+def validate_toeplitz_correctness(m: int = 128,
+                                  batch: int = 4,
+                                  dtype: torch.dtype = torch.float32,
+                                  device: str = "cuda",
+                                  rtol: float = 1e-4,
+                                  atol: float = 1e-5) -> bool:
+    """
+    Validate Triton Toeplitz forward and backward against the reference PyTorch implementation.
+
+    - Forward: compares `toeplitz_triton(vals)` vs `reference_toeplitz(vals)`.
+    - Backward: compares gradients w.r.t. `vals` using the same upstream gradient.
+
+    Returns True if both comparisons pass; raises AssertionError otherwise.
+    """
+    # Forward check
+    vals = torch.randn(batch, m, device=device, dtype=dtype)
+    out_triton = toeplitz_triton(vals)
+    out_ref = reference_toeplitz(vals)
+    torch.testing.assert_close(out_triton, out_ref, rtol=rtol, atol=atol)
+
+    # Backward check (use same upstream gradient for both paths)
+    vals_t = vals.clone().detach().requires_grad_(True)
+    out_t = toeplitz_triton(vals_t)
+    upstream = torch.randn_like(out_t)
+    out_t.backward(upstream)
+    grad_triton = vals_t.grad
+
+    vals_r = vals.clone().detach().requires_grad_(True)
+    out_r = reference_toeplitz(vals_r)
+    out_r.backward(upstream)
+    grad_ref = vals_r.grad
+
+    torch.testing.assert_close(grad_triton, grad_ref, rtol=rtol, atol=atol)
+    return True
+
+if __name__ == "__main__":
+
+    validate_toeplitz_correctness()
+    bench.run(print_data=True)
+    bench_backward.run(print_data=True)
