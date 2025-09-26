@@ -60,6 +60,7 @@ def toeplitz_fwd_kernel(
         triton.Config({"BLOCK_SIZE_M": 512}, num_warps=8),
     ],
     key=["M"],
+    reset_to_zero=["grad_vals_ptr"],
 )
 @triton.jit
 def toeplitz_bwd_kernel(
@@ -77,7 +78,7 @@ def toeplitz_bwd_kernel(
     b = tl.program_id(0)  # batch id
     row_block = tl.program_id(1)  # row block id
 
-    # Tile rows handled by this program
+    # Tile rows handled by this program (mirror forward kernel)
     row_start = row_block * BLOCK_SIZE_M
     rows = row_start + tl.arange(0, BLOCK_SIZE_M)
     cols = tl.arange(0, M)
@@ -85,25 +86,31 @@ def toeplitz_bwd_kernel(
     row_mask = rows < M
     col_mask = cols < M
 
-    # Compute Toeplitz index difference: k = i - j
+    # Only lower-triangular contributes: d = i - j >= 0
     d = rows[:, None] - cols[None, :]
     lower_mask = d >= 0
 
-    # Load grads from grad_out for this tile
+    # Load upstream grads for this tile
     gout_ptrs = (
         grad_out_ptr
         + b * stride_gout_b
         + rows[:, None] * stride_gout_i
         + cols[None, :] * stride_gout_j
     )
-    grads = tl.load(gout_ptrs, mask=lower_mask & row_mask[:, None] & col_mask[None, :], other=0)
+    grads = tl.load(
+        gout_ptrs,
+        mask=lower_mask & row_mask[:, None] & col_mask[None, :],
+        other=0,
+    )
 
-    # Atomically accumulate into grad_vals at index k = i - j
-    gvals_b_ptr = grad_vals_ptr + b * stride_gvals_b
-    # Use safe offsets to avoid invalid pointers on masked lanes
-    safe_d = tl.where(lower_mask, d, 0)
-    gvals_ptrs = gvals_b_ptr + safe_d * stride_gvals_m
-    tl.atomic_add(gvals_ptrs, grads, mask=lower_mask & row_mask[:, None] & col_mask[None, :])
+    # Atomically accumulate into grad_vals at index d = i - j
+    gvals_base = grad_vals_ptr + b * stride_gvals_b
+    gvals_ptrs = gvals_base + d * stride_gvals_m
+    tl.atomic_add(
+        gvals_ptrs,
+        grads,
+        mask=lower_mask & row_mask[:, None] & col_mask[None, :],
+    )
 
 
 class Toeplitz(torch.autograd.Function):
@@ -299,7 +306,7 @@ def validate_toeplitz_correctness(m: int = 128,
 if __name__ == "__main__":
 
     validate_toeplitz_correctness(m=16)
-    # bench.run(print_data=True)
-    # bench_backward.run(print_data=True)
+    bench.run(print_data=True)
+    bench_backward.run(print_data=True)
 
 

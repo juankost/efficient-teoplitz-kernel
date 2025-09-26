@@ -1,7 +1,12 @@
 import os
+import sys
+
+# Allow running this script from the repository's scripts/ directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 import torch
 import matplotlib.pyplot as plt
-from efficient_toeplitz_kernel import (
+from src.efficient_toeplitz_kernel import (
     reference_toeplitz,
     reference_toeplitz_compiled,
     toeplitz_triton,
