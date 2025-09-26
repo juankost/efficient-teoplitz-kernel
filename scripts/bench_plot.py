@@ -34,7 +34,7 @@ def main():
     device = "cuda"
     dtype = torch.float32
     batch = 16
-    sizes = [64, 128, 256, 512, 1024, 2048]
+    sizes = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
     results = {"eager": [], "compiled": [], "triton": []}
 
@@ -43,6 +43,8 @@ def main():
 
         ms_eager = time_ms(reference_toeplitz, vals)
         ms_comp = time_ms(reference_toeplitz_compiled, vals)
+        # Backward selection benchmark via env override
+        os.environ["EFK_BWD_IMPL"] = "kstripe"
         ms_triton = time_ms(toeplitz_triton, vals)
 
         results["eager"].append(ms_eager)

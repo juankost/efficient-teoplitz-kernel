@@ -1,4 +1,5 @@
 import torch
+import os
 import triton
 import triton.language as tl
 import math
@@ -50,6 +51,61 @@ def toeplitz_fwd_kernel(
     # Store into output
     out_ptrs = out_ptr + b * stride_out_b + rows[:, None] * stride_out_i + cols[None, :] * stride_out_j
     tl.store(out_ptrs, v, mask=row_mask[:, None] & col_mask[None, :])
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128}, num_warps=8, num_stages=3),
+    ],
+    key=["M"],
+)
+@triton.jit
+def toeplitz_fwd_kernel_2d(
+    vals_ptr,    # [B, M]
+    out_ptr,     # [B, M, M]
+    stride_vals_b,
+    stride_vals_m,
+    stride_out_b,
+    stride_out_i,
+    stride_out_j,
+    B: tl.constexpr,
+    M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    row_start = pid_m * BLOCK_SIZE_M
+    col_start = pid_n * BLOCK_SIZE_N
+
+    # skip tiles strictly above the diagonal
+    if pid_n > pid_m:
+        return
+
+    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+    cols = col_start + tl.arange(0, BLOCK_SIZE_N)
+    row_mask = rows < M
+    col_mask = cols < M
+
+    d = rows[:, None] - cols[None, :]
+    lower_mask = (d >= 0) & row_mask[:, None] & col_mask[None, :]
+
+    vals_b_ptr = vals_ptr + pid_b * stride_vals_b
+    d_safe = tl.where(lower_mask, d, 0)
+    v = tl.load(vals_b_ptr + d_safe * stride_vals_m, mask=lower_mask, other=0)
+
+    out_ptrs = (
+        out_ptr
+        + pid_b * stride_out_b
+        + rows[:, None] * stride_out_i
+        + cols[None, :] * stride_out_j
+    )
+    tl.store(out_ptrs, v, mask=lower_mask, eviction_policy="evict_last")
 
 
 @triton.autotune(
@@ -113,6 +169,206 @@ def toeplitz_bwd_kernel(
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3),
+    ],
+    key=["M"],
+    reset_to_zero=["grad_vals_ptr"],
+)
+@triton.jit
+def toeplitz_bwd_kernel_kstripe(
+    grad_vals_ptr,  # [B, M]
+    grad_out_ptr,   # [B, M, M]
+    stride_gvals_b,
+    stride_gvals_m,
+    stride_gout_b,
+    stride_gout_i,
+    stride_gout_j,
+    B: tl.constexpr,
+    M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    row_start = pid_m * BLOCK_SIZE_M
+    k_start = pid_k * BLOCK_SIZE_K
+
+    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+    ks = k_start + tl.arange(0, BLOCK_SIZE_K)
+
+    row_mask = rows < M
+    k_mask = ks < M
+
+    # j = i - k
+    j = rows[:, None] - ks[None, :]
+    lower_mask = (j >= 0) & row_mask[:, None] & k_mask[None, :]
+    j_safe = tl.where(lower_mask, j, 0)
+
+    gout_ptrs = (
+        grad_out_ptr
+        + pid_b * stride_gout_b
+        + rows[:, None] * stride_gout_i
+        + j_safe * stride_gout_j
+    )
+    grads = tl.load(gout_ptrs, mask=lower_mask, other=0)
+
+    # reduce across rows for each diagonal k in this tile
+    partial = tl.sum(grads, axis=0)
+
+    gvals_base = grad_vals_ptr + pid_b * stride_gvals_b
+    gvals_ptrs = gvals_base + ks * stride_gvals_m
+    tl.atomic_add(gvals_ptrs, partial, mask=k_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_M": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 512}, num_warps=8, num_stages=3),
+    ],
+    key=["M"],
+    reset_to_zero=["grad_vals_ptr"],
+)
+@triton.jit
+def toeplitz_bwd_kernel_diag(
+    grad_vals_ptr,  # [B, M]
+    grad_out_ptr,   # [B, M, M]
+    stride_gvals_b,
+    stride_gvals_m,
+    stride_gout_b,
+    stride_gout_i,
+    stride_gout_j,
+    B: tl.constexpr,
+    M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_rb = tl.program_id(2)
+
+    # diagonal index
+    k = pid_k
+    if k >= M:
+        return
+
+    row_start = pid_rb * BLOCK_SIZE_M + k
+    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+    row_mask = rows < M
+
+    # along diagonal: j = i - k
+    j = rows - k
+    j_mask = j >= 0
+    mask = row_mask & j_mask
+    j_safe = tl.where(mask, j, 0)
+
+    gout_ptrs = (
+        grad_out_ptr
+        + pid_b * stride_gout_b
+        + rows * stride_gout_i
+        + j_safe * stride_gout_j
+    )
+    grads = tl.load(gout_ptrs, mask=mask, other=0)
+    partial = tl.sum(grads, axis=0)
+
+    gvals_ptr = grad_vals_ptr + pid_b * stride_gvals_b + k * stride_gvals_m
+    tl.atomic_add(gvals_ptr, partial)
+
+@triton.autotune(
+    configs=[
+        # k-stripe variants
+        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2),
+        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3),
+        triton.Config({"USE_DIAG": 0, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3),
+        # diagonal variants (BLOCK_SIZE_K is dummy)
+        triton.Config({"USE_DIAG": 1, "BLOCK_SIZE_M": 256, "BLOCK_SIZE_K": 1}, num_warps=4, num_stages=2),
+        triton.Config({"USE_DIAG": 1, "BLOCK_SIZE_M": 512, "BLOCK_SIZE_K": 1}, num_warps=8, num_stages=3),
+    ],
+    key=["M"],
+    reset_to_zero=["grad_vals_ptr"],
+)
+@triton.jit
+def toeplitz_bwd_kernel_auto(
+    grad_vals_ptr,  # [B, M]
+    grad_out_ptr,   # [B, M, M]
+    stride_gvals_b,
+    stride_gvals_m,
+    stride_gout_b,
+    stride_gout_i,
+    stride_gout_j,
+    B: tl.constexpr,
+    M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    USE_DIAG: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    if USE_DIAG:
+        # layout: (b, k, row_block)
+        pid_k = tl.program_id(1)
+        pid_rb = tl.program_id(2)
+
+        k = pid_k
+        if k >= M:
+            return
+
+        row_start = pid_rb * BLOCK_SIZE_M + k
+        rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = rows < M
+
+        j = rows - k
+        j_mask = j >= 0
+        mask = row_mask & j_mask
+        j_safe = tl.where(mask, j, 0)
+
+        gout_ptrs = (
+            grad_out_ptr
+            + pid_b * stride_gout_b
+            + rows * stride_gout_i
+            + j_safe * stride_gout_j
+        )
+        grads = tl.load(gout_ptrs, mask=mask, other=0)
+        partial = tl.sum(grads, axis=0)
+
+        gvals_ptr = grad_vals_ptr + pid_b * stride_gvals_b + k * stride_gvals_m
+        tl.atomic_add(gvals_ptr, partial)
+    else:
+        # k-stripe layout: (b, row_block, k_block)
+        pid_m = tl.program_id(1)
+        pid_k = tl.program_id(2)
+
+        row_start = pid_m * BLOCK_SIZE_M
+        k_start = pid_k * BLOCK_SIZE_K
+
+        rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+        ks = k_start + tl.arange(0, BLOCK_SIZE_K)
+
+        row_mask = rows < M
+        k_mask = ks < M
+
+        j = rows[:, None] - ks[None, :]
+        lower_mask = (j >= 0) & row_mask[:, None] & k_mask[None, :]
+        j_safe = tl.where(lower_mask, j, 0)
+
+        gout_ptrs = (
+            grad_out_ptr
+            + pid_b * stride_gout_b
+            + rows[:, None] * stride_gout_i
+            + j_safe * stride_gout_j
+        )
+        grads = tl.load(gout_ptrs, mask=lower_mask, other=0)
+        partial = tl.sum(grads, axis=0)
+
+        gvals_base = grad_vals_ptr + pid_b * stride_gvals_b
+        gvals_ptrs = gvals_base + ks * stride_gvals_m
+        tl.atomic_add(gvals_ptrs, partial, mask=k_mask)
+
 class Toeplitz(torch.autograd.Function):
     @staticmethod
     def forward(ctx, vals: torch.Tensor):
@@ -126,8 +382,12 @@ class Toeplitz(torch.autograd.Function):
         stride_vals_b, stride_vals_m = vals_2d.stride()
         stride_out_b, stride_out_i, stride_out_j = out.stride()
 
-        grid = lambda META: (b, triton.cdiv(m, META["BLOCK_SIZE_M"]))
-        toeplitz_fwd_kernel[grid](
+        grid_2d = lambda META: (
+            b,
+            triton.cdiv(m, META["BLOCK_SIZE_M"]),
+            triton.cdiv(m, META["BLOCK_SIZE_N"]),
+        )
+        toeplitz_fwd_kernel_2d[grid_2d](
             vals_2d,
             out,
             stride_vals_b,
@@ -137,7 +397,6 @@ class Toeplitz(torch.autograd.Function):
             stride_out_j,
             B=b,
             M=m,
-
         )
         ctx.m = m
         ctx.shapes = shapes
@@ -155,8 +414,13 @@ class Toeplitz(torch.autograd.Function):
         stride_gvals_b, stride_gvals_m = grad_vals.stride()
         stride_gout_b, stride_gout_i, stride_gout_j = grad_output_3d.stride()
 
-        grid = lambda META: (b, triton.cdiv(m, META["BLOCK_SIZE_M"]))
-        toeplitz_bwd_kernel[grid](
+        # Always use the unified autotuned kernel; it will pick diag vs k-stripe
+        grid_auto = lambda META: (
+            b,
+            (m if META["USE_DIAG"] else triton.cdiv(m, META["BLOCK_SIZE_M"])),
+            (triton.cdiv(max(m - 0, 0), META["BLOCK_SIZE_M"]) if META["USE_DIAG"] else triton.cdiv(m, META["BLOCK_SIZE_K"]))
+        )
+        toeplitz_bwd_kernel_auto[grid_auto](
             grad_vals,
             grad_output_3d,
             stride_gvals_b,
@@ -224,18 +488,18 @@ def bench(m: int, provider: str, dtype: torch.dtype, batch: int):
     vals = torch.randn(batch, m, device=device, dtype=dtype)
 
     if provider == "eager":
-        ms = triton.testing.do_bench(reference_toeplitz, vals)
+        ms = triton.testing.do_bench(lambda: reference_toeplitz(vals))
     if provider == "compiled":
-        ms = triton.testing.do_bench(reference_toeplitz_compiled, vals)
+        ms = triton.testing.do_bench(lambda: reference_toeplitz_compiled(vals))
     if provider == "triton":
-        ms = triton.testing.do_bench(toeplitz_triton, vals)
+        ms = triton.testing.do_bench(lambda: toeplitz_triton(vals))
     return ms
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["m"],
-        x_vals=[64, 128, 256, 512, 1024],
+        x_vals=[64, 128, 256, 512, 1024, 2048],
         line_arg="provider",
         line_vals=["pytorch", "triton"],
         line_names=["PyTorch Backward", "Triton Backward"],
